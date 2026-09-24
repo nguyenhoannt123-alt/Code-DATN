@@ -11,9 +11,18 @@
 #include <hd44780ioClass/hd44780_I2Cexp.h>
 #include <esp_task_wdt.h>
 #include <esp_arduino_version.h>
-const char* WIFI_SSID = "NGUYEN HIEP";//Tên wifi
-const char* WIFI_PASSWORD = "07012012";//mk
+const char* WIFI_DEFAULT_SSID = "NGUYEN HIEP";
+const char* WIFI_DEFAULT_PASSWORD = "07012012";
+String WIFI_SSID = WIFI_DEFAULT_SSID;
+String WIFI_PASSWORD = WIFI_DEFAULT_PASSWORD;
+const char* WIFI_SETUP_AP = "SmartDoor_Direct";
+const char* WIFI_SETUP_PASSWORD = "12345678";
 const char* MDNS_HOSTNAME = "smartdoor";
+bool wifiConfigPortalActive = false;
+uint8_t previousAPClientCount = 0;
+const unsigned long APP_CONNECTION_TIMEOUT = 5000;
+unsigned long lastAppContactAt = 0;
+bool appConnected = false;
 bool mdnsOK = false;
 #define LCD_SDA 21
 #define LCD_SCL 22
@@ -38,21 +47,26 @@ bool mdnsOK = false;
 #define DOOR_UNLOCK_LEVEL LOW
 #define BUZZER_ON_LEVEL HIGH
 #define BUZZER_OFF_LEVEL LOW
-const String USER_PASSWORD = "123456";
+const String DEFAULT_USER_PASSWORD = "123456";
+String userPassword = DEFAULT_USER_PASSWORD;
+const String DEFAULT_ADMIN_PASSWORD = "654321";
+String adminPassword = DEFAULT_ADMIN_PASSWORD;
+const byte MIN_PASSWORD_LENGTH = 4;
+const byte MAX_PASSWORD_LENGTH = 12;
 const unsigned long DOOR_OPEN_TIME = 5000;
 const unsigned long DOOR_WARNING_TIME = 3000;
 const unsigned long LOCKOUT_TIME = 10000;
 const unsigned long BUZZER_TIME = 10000;
-const unsigned long RESULT_TIME = 2000;//cảnh báo cb đóng cửa
+const unsigned long RESULT_TIME = 2000;
 const unsigned long HOLD_FINGER_TIME = 1000;
 const unsigned long FINGER_HOLD_LOST_TIMEOUT = 300;
 const unsigned long FINGER_REMOVE_WAIT_TIMEOUT = 5000;
 const unsigned long FINGER_SCAN_INTERVAL = 40;
 const unsigned long KEY_DEBOUNCE_TIME = 60;
-const unsigned long PASSWORD_INPUT_TIMEOUT = 10000;//chờ nhập mk 10s
+const unsigned long PASSWORD_INPUT_TIMEOUT = 10000;
 const unsigned long WIFI_RECONNECT_INTERVAL = 10000;
 const unsigned long SENSOR_RETRY_INTERVAL = 10000;
-const uint32_t WATCHDOG_TIMEOUT_SECONDS = 15;//làm mới wdt
+const uint32_t WATCHDOG_TIMEOUT_SECONDS = 15;
 const byte REQUIRED_EMPTY_SENSOR_COUNT = 5;
 const byte REQUIRED_FINGER_DETECTED_COUNT = 1;
 const byte REQUIRED_NO_FINGER_COUNT = 2;
@@ -61,20 +75,19 @@ const uint16_t MAX_FINGER_ID = 127;
 const unsigned long ENROLL_FINGER_TIMEOUT = 60000;
 const unsigned long REMOVE_FINGER_TIMEOUT = 20000;
 const unsigned long WIFI_LOST_DISPLAY_TIME = 2000;
-const unsigned long RECONNECT_IP_DISPLAY_TIME = 3000;
+const unsigned long RECONNECT_IP_DISPLAY_TIME = 2000;
 const byte MAX_FAILED_ATTEMPTS = 5;
 byte failedAttempts = 0;
 unsigned long lockoutStartedAt = 0;
-const String RFID_ALLOWED_UID = "26301D06";
-
-//chống quét lặp rfid
+const String DEFAULT_RFID_UID = "26301D06";
+const byte MAX_RFID_CARDS = 10;
+String allowedRfidCards[MAX_RFID_CARDS];
+byte allowedRfidCount = 0;
 bool rfidCardLatched = false;
 byte rfidMissingCount = 0;
 unsigned long rfidLastPresenceProbe = 0;
-
 const unsigned long RFID_PRESENCE_PROBE_INTERVAL = 200;
-const byte RFID_MISSING_REQUIRED = 3;//0,6s sau được quét lại
-
+const byte RFID_MISSING_REQUIRED = 3;
 hd44780_I2Cexp lcd;
 HardwareSerial fingerSerial(2);
 Adafruit_Fingerprint finger(&fingerSerial);
@@ -82,12 +95,12 @@ MFRC522 rfid( RFID_SS_PIN, RFID_RST_PIN );
 WebServer server(80);
 Preferences prefs;
 enum SystemState {
-  STATE_BOOT, STATE_WAITING, STATE_USER_PASSWORD, STATE_FINGER_HOLDING, STATE_FINGER_WAIT_REMOVE, STATE_FINGER_VERIFY, STATE_RFID_VERIFY, STATE_SHOW_RESULT, STATE_DOOR_OPEN, STATE_APP_ENROLLING, STATE_APP_DELETING, STATE_LOCKOUT
+  STATE_BOOT, STATE_WAITING, STATE_USER_PASSWORD, STATE_FINGER_HOLDING, STATE_FINGER_WAIT_REMOVE, STATE_FINGER_VERIFY, STATE_RFID_VERIFY, STATE_SHOW_RESULT, STATE_DOOR_OPEN, STATE_APP_ENROLLING, STATE_APP_DELETING, STATE_LOCAL_ADMIN, STATE_LOCKOUT
 }
 ;
 SystemState systemState = STATE_BOOT;
 enum NetworkDisplayState {
-  NET_DISPLAY_NONE, NET_DISPLAY_WIFI_LOST, NET_DISPLAY_RECONNECTED_IP
+  NET_DISPLAY_NONE, NET_DISPLAY_APP_LOST, NET_DISPLAY_RECONNECTED_IP
 }
 ;
 NetworkDisplayState networkDisplayState = NET_DISPLAY_NONE;
@@ -167,6 +180,128 @@ struct DoorHistoryItem {
 const byte MAX_HISTORY = 5;
 DoorHistoryItem doorHistory[MAX_HISTORY];
 byte doorHistoryCount = 0;
+int findAllowedRfidIndex( const String& uid ) {
+  for ( byte i = 0; i < allowedRfidCount; i++ ) {
+    if ( allowedRfidCards[i] == uid ) {
+      return i;
+    }
+  }
+  return -1;
+}
+bool isRFIDAllowed( const String& uid ) {
+  return findAllowedRfidIndex( uid ) >= 0;
+}
+void saveRfidCardsToFlash() {
+  prefs.putUChar( "rfid_count", allowedRfidCount );
+  for ( byte i = 0; i < MAX_RFID_CARDS; i++ ) {
+    String key = "rfid" + String(i);
+    if ( i < allowedRfidCount ) {
+      prefs.putString( key.c_str(), allowedRfidCards[i] );
+    } else {
+      prefs.remove( key.c_str() );
+    }
+  }
+}
+bool addAllowedRfid( const String& uid ) {
+  if ( uid.length() == 0 ) {
+    return false;
+  }
+  if ( isRFIDAllowed(uid) ) {
+    return false;
+  }
+  if ( allowedRfidCount >= MAX_RFID_CARDS ) {
+    return false;
+  }
+  allowedRfidCards[allowedRfidCount] = uid;
+  allowedRfidCount++;
+  saveRfidCardsToFlash();
+  return true;
+}
+bool deleteAllowedRfid( const String& uid ) {
+  int index = findAllowedRfidIndex( uid );
+  if ( index < 0 ) {
+    return false;
+  }
+  for ( byte i = index; i + 1 < allowedRfidCount; i++ ) {
+    allowedRfidCards[i] = allowedRfidCards[i + 1];
+  }
+  if ( allowedRfidCount > 0 ) {
+    allowedRfidCount--;
+  }
+  if ( allowedRfidCount < MAX_RFID_CARDS ) {
+    allowedRfidCards[allowedRfidCount] = "";
+  }
+  saveRfidCardsToFlash();
+  return true;
+}
+void saveUserPasswordToFlash() {
+  prefs.putString( "user_pass", userPassword );
+}
+void saveAdminPasswordToFlash() {
+  prefs.putString( "admin_pass", adminPassword );
+}
+void loadSecurityConfig() {
+  bool initialized =
+    prefs.getBool( "sec_init", false );
+  if ( !initialized ) {
+    userPassword = DEFAULT_USER_PASSWORD;
+    adminPassword = DEFAULT_ADMIN_PASSWORD;
+    allowedRfidCount = 1;
+    allowedRfidCards[0] = DEFAULT_RFID_UID;
+    saveUserPasswordToFlash();
+    saveAdminPasswordToFlash();
+    saveRfidCardsToFlash();
+    prefs.putBool( "sec_init", true );
+    Serial.println( "KHOI TAO CAU HINH BAO MAT MAC DINH" );
+    return;
+  }
+  userPassword =
+    prefs.getString(
+      "user_pass",
+      DEFAULT_USER_PASSWORD
+    );
+  adminPassword =
+    prefs.getString(
+      "admin_pass",
+      DEFAULT_ADMIN_PASSWORD
+    );
+  if (
+    userPassword.length() < MIN_PASSWORD_LENGTH
+    ||
+    userPassword.length() > MAX_PASSWORD_LENGTH
+  ) {
+    userPassword = DEFAULT_USER_PASSWORD;
+    saveUserPasswordToFlash();
+  }
+  if (
+    adminPassword.length() < MIN_PASSWORD_LENGTH
+    ||
+    adminPassword.length() > MAX_PASSWORD_LENGTH
+  ) {
+    adminPassword = DEFAULT_ADMIN_PASSWORD;
+    saveAdminPasswordToFlash();
+  }
+  allowedRfidCount =
+    prefs.getUChar(
+      "rfid_count",
+      0
+    );
+  if ( allowedRfidCount > MAX_RFID_CARDS ) {
+    allowedRfidCount = MAX_RFID_CARDS;
+  }
+  for ( byte i = 0; i < allowedRfidCount; i++ ) {
+    String key = "rfid" + String(i);
+    allowedRfidCards[i] =
+      prefs.getString(
+        key.c_str(),
+        ""
+      );
+  }
+  Serial.print( "MAT KHAU DA NAP: " );
+  Serial.println( "******" );
+  Serial.print( "SO THE RFID DUOC PHEP: " );
+  Serial.println( allowedRfidCount );
+}
 void feedWatchdog() { if (watchdogEnabled) esp_task_wdt_reset(); }
 void setupWatchdog() {
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
@@ -244,6 +379,8 @@ String getSystemStateName() {
     return "ENROLLING";
     case STATE_APP_DELETING:
     return "DELETING";
+    case STATE_LOCAL_ADMIN:
+    return "LOCAL_ADMIN";
     case STATE_LOCKOUT:
     return "LOCKOUT";
   }
@@ -255,8 +392,8 @@ void updateLCDByState() {
     case STATE_BOOT:
     showLCD( "DANG KHOI DONG", "SMART DOOR..." );
     break;
-    case STATE_WAITING:
-    if ( WiFi.status() == WL_CONNECTED ) {
+    case STATE_WAITING: {
+    if ( appConnected ) {
       if ( fingerOK && rfidOK ) {
         showLCD( "CUA DANG KHOA", "VT/THE/MK + APP" );
       } else if ( fingerOK ) {
@@ -278,6 +415,7 @@ void updateLCDByState() {
       }
     }
     break;
+    }
     case STATE_FINGER_HOLDING:
     showLCD( "DANG XAC MINH", "GIU TAY 1 GIAY" );
     break;
@@ -300,6 +438,9 @@ void updateLCDByState() {
     } else {
       showLCD( "CUA DANG MO", "XIN MOI VAO!" );
     }
+    break;
+    case STATE_LOCAL_ADMIN:
+    showLCD( "CHE DO QUAN TRI", "TREN PHAN CUNG" );
     break;
     case STATE_LOCKOUT:
     showLCD( "CANH BAO!", "KHOA HE THONG!!!" );
@@ -377,8 +518,6 @@ void updateLockout() { if (systemState==STATE_LOCKOUT && millis()-lockoutStarted
 void addDoorHistory( const String& method, const String& detail );
 void authenticationFailed( const String& reason ) {
   failedAttempts++;
-
-  // Luu ca cac lan xac thuc sai de theo doi truy cap bat thuong.
   addDoorHistory("XAC THUC SAI", reason);
   Serial.print( "XAC THUC SAI: " );
   Serial.print( failedAttempts );
@@ -610,6 +749,7 @@ char readKeypad() {
   }
   return 0;
 }
+void runLocalAdminMenu();
 void processKeypad() {
   if ( systemState == STATE_LOCKOUT || systemState == STATE_FINGER_HOLDING || systemState == STATE_FINGER_WAIT_REMOVE || systemState == STATE_FINGER_VERIFY || systemState == STATE_RFID_VERIFY || systemState == STATE_SHOW_RESULT || systemState == STATE_DOOR_OPEN || systemState == STATE_APP_ENROLLING || systemState == STATE_APP_DELETING ) {
     return;
@@ -630,6 +770,14 @@ void processKeypad() {
   Serial.println( key );
   lastKeyInputAt = millis();
   if ( key == '*' ) {
+    if (
+      systemState == STATE_WAITING
+      &&
+      inputBuffer.length() == 0
+    ) {
+      runLocalAdminMenu();
+      return;
+    }
     if ( inputBuffer.length() == 0 ) {
       showWaitingScreen();
       return;
@@ -645,7 +793,7 @@ void processKeypad() {
     return;
   }
   if ( key >= '0' && key <= '9' ) {
-    if ( inputBuffer.length() < 10 ) {
+    if ( inputBuffer.length() < MAX_PASSWORD_LENGTH ) {
       inputBuffer += key;
     }
     systemState = STATE_USER_PASSWORD;
@@ -662,7 +810,7 @@ void processKeypad() {
     showResult( "CHUA NHAP MA", "VUI LONG NHAP" );
     return;
   }
-  if ( inputBuffer == USER_PASSWORD ) {
+  if ( inputBuffer == userPassword ) {
     inputBuffer = "";
     lastKeyInputAt = 0;
     unlockDoor( "MAT KHAU", "Mo bang keypad" );
@@ -1082,56 +1230,38 @@ void setupRFID() {
 }
 bool probeRFIDCardPresence() {
   if (!rfidOK) return false;
-
   resetRFIDForNextScan();
-
   if (!rfidOK) return false;
   if (!rfid.PICC_IsNewCardPresent()) return false;
   if (!rfid.PICC_ReadCardSerial()) return false;
-
   rfid.PICC_HaltA();
   rfid.PCD_StopCrypto1();
-
   return true;
 }
-
 void processRFID() {
   if (!rfidOK) return;
-
-  // Đã quét 1 lần: chỉ chờ đến khi thẻ được nhấc ra
   if (rfidCardLatched) {
     if (millis() - rfidLastPresenceProbe < RFID_PRESENCE_PROBE_INTERVAL) return;
-
     rfidLastPresenceProbe = millis();
-
     if (probeRFIDCardPresence()) {
       rfidMissingCount = 0;
       return;
     }
-
     rfidMissingCount++;
-
     if (rfidMissingCount >= RFID_MISSING_REQUIRED) {
       rfidCardLatched = false;
       rfidMissingCount = 0;
       resetRFIDForNextScan();
     }
-
     return;
   }
-
-  // Chỉ quét mới khi hệ thống đang chờ
   if (systemState != STATE_WAITING) return;
   if (!rfid.PICC_IsNewCardPresent()) return;
-
   networkDisplayState = NET_DISPLAY_NONE;
   systemState = STATE_RFID_VERIFY;
   updateLCDByState();
-
   delay(30);
-
   bool readOK = false;
-
   for (byte i = 0; i < 3; i++) {
     if (rfid.PICC_ReadCardSerial()) {
       readOK = true;
@@ -1139,29 +1269,655 @@ void processRFID() {
     }
     delay(40);
   }
-
   if (!readOK) {
     showWaitingScreen();
     return;
   }
-
   String uid = getRFIDUID();
-
   Serial.print("UID RFID: ");
   Serial.println(uid);
-
   rfid.PICC_HaltA();
   rfid.PCD_StopCrypto1();
-
   rfidCardLatched = true;
   rfidMissingCount = 0;
   rfidLastPresenceProbe = millis();
-
-  if (uid == RFID_ALLOWED_UID) {
+  if ( isRFIDAllowed(uid) ) {
     unlockDoor("THE RFID", "UID " + uid);
   } else {
     authenticationFailed("THE RFID SAI");
   }
+}
+void serviceAdminBackground() {
+  feedWatchdog();
+  if (
+    webServerStarted
+    &&
+    (
+      WiFi.status() == WL_CONNECTED
+      ||
+      wifiConfigPortalActive
+    )
+  ) {
+    server.handleClient();
+  }
+  delay(5);
+}
+char waitAdminKey( unsigned long timeoutMs ) {
+  unsigned long startedAt = millis();
+  while ( millis() - startedAt < timeoutMs ) {
+    serviceAdminBackground();
+    char key = readKeypad();
+    if ( key != 0 ) {
+      return key;
+    }
+  }
+  return 0;
+}
+bool readAdminDigits(
+  const String& title,
+  String& value,
+  byte minLen,
+  byte maxLen,
+  bool hidden,
+  unsigned long timeoutMs
+) {
+  value = "";
+  unsigned long startedAt = millis();
+  while ( millis() - startedAt < timeoutMs ) {
+    if ( hidden ) {
+      if ( lcdOK ) {
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print( title.substring(0, 16) );
+        lcd.setCursor(0, 1);
+        for ( unsigned int i = 0; i < value.length(); i++ ) {
+          lcd.print('*');
+        }
+      }
+    } else {
+      showLCD(
+        title,
+        value.length() > 0
+          ? value + "  #=OK"
+          : "#=OK *=HUY"
+      );
+    }
+    char key = waitAdminKey( 250 );
+    if ( key == 0 ) {
+      continue;
+    }
+    startedAt = millis();
+    if ( key >= '0' && key <= '9' ) {
+      if ( value.length() < maxLen ) {
+        value += key;
+      }
+      continue;
+    }
+    if ( key == '*' ) {
+      if ( value.length() == 0 ) {
+        return false;
+      }
+      value.remove(
+        value.length() - 1
+      );
+      continue;
+    }
+    if ( key == '#' ) {
+      if (
+        value.length() >= minLen
+        &&
+        value.length() <= maxLen
+      ) {
+        return true;
+      }
+      beepErrorShort();
+      showLCD(
+        "DO DAI KHONG DUNG",
+        "THU LAI"
+      );
+      delay(1200);
+      continue;
+    }
+  }
+  return false;
+}
+void waitAdminResult() {
+  unsigned long startedAt = millis();
+  while ( millis() - startedAt < 2200 ) {
+    serviceAdminBackground();
+  }
+  systemState = STATE_LOCAL_ADMIN;
+}
+char getAdminMenuChoice() {
+  byte page = 0;
+  byte row = 0;
+  auto drawMenu = [&]() {
+    if ( !lcdOK ) {
+      return;
+    }
+    lcd.clear();
+    if ( page == 0 ) {
+      lcd.setCursor(0, 0);
+      lcd.print(
+        row == 0
+          ? ">1 THEM VAN TAY"
+          : " 1 THEM VAN TAY"
+      );
+      lcd.setCursor(0, 1);
+      lcd.print(
+        row == 1
+          ? ">2 XOA VAN TAY"
+          : " 2 XOA VAN TAY"
+      );
+    }
+    else if ( page == 1 ) {
+      lcd.setCursor(0, 0);
+      lcd.print(
+        row == 0
+          ? ">3 THEM THE RFID"
+          : " 3 THEM THE RFID"
+      );
+      lcd.setCursor(0, 1);
+      lcd.print(
+        row == 1
+          ? ">4 XOA THE RFID"
+          : " 4 XOA THE RFID"
+      );
+    }
+    else {
+      lcd.setCursor(0, 0);
+      lcd.print(
+        row == 0
+          ? ">5 DOI MK CUA"
+          : " 5 DOI MK CUA"
+      );
+      lcd.setCursor(0, 1);
+      lcd.print(
+        row == 1
+          ? ">6 DOI MK ADMIN"
+          : " 6 DOI MK ADMIN"
+      );
+    }
+  };
+  drawMenu();
+  while ( true ) {
+    char key = waitAdminKey( 100 );
+    if ( key == 0 ) {
+      continue;
+    }
+    if ( key == '*' ) {
+      return '0';
+    }
+    if ( key == '2' ) {
+      if ( row == 1 ) {
+        row = 0;
+      } else {
+        row = 1;
+        if ( page == 0 ) {
+          page = 2;
+        } else {
+          page--;
+        }
+      }
+      drawMenu();
+      continue;
+    }
+    if ( key == '8' ) {
+      if ( row == 0 ) {
+        row = 1;
+      } else {
+        row = 0;
+        page++;
+        if ( page > 2 ) {
+          page = 0;
+        }
+      }
+      drawMenu();
+      continue;
+    }
+    if ( key == '#' ) {
+      if ( page == 0 && row == 0 ) {
+        return '1';
+      }
+      if ( page == 0 && row == 1 ) {
+        return '2';
+      }
+      if ( page == 1 && row == 0 ) {
+        return '3';
+      }
+      if ( page == 1 && row == 1 ) {
+        return '4';
+      }
+      if ( page == 2 && row == 0 ) {
+        return '5';
+      }
+      if ( page == 2 && row == 1 ) {
+        return '6';
+      }
+    }
+  }
+}
+bool scanRfidForAdmin(
+  String& uid,
+  unsigned long timeoutMs
+) {
+  uid = "";
+  if ( !rfidOK ) {
+    showLCD(
+      "RC522 DANG LOI",
+      "KHONG THE QUET"
+    );
+    delay(1800);
+    return false;
+  }
+  rfidCardLatched = false;
+  rfidMissingCount = 0;
+  resetRFIDForNextScan();
+  showLCD(
+    "QUET THE RFID",
+    "* = HUY"
+  );
+  unsigned long startedAt = millis();
+  while ( millis() - startedAt < timeoutMs ) {
+    serviceAdminBackground();
+    char key = readKeypad();
+    if ( key == '*' ) {
+      return false;
+    }
+    if ( !rfid.PICC_IsNewCardPresent() ) {
+      delay(20);
+      continue;
+    }
+    bool readOK = false;
+    for ( byte i = 0; i < 3; i++ ) {
+      if ( rfid.PICC_ReadCardSerial() ) {
+        readOK = true;
+        break;
+      }
+      delay(40);
+    }
+    if ( !readOK ) {
+      continue;
+    }
+    uid = getRFIDUID();
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+    Serial.print( "ADMIN RFID UID: " );
+    Serial.println( uid );
+    resetRFIDForNextScan();
+    return uid.length() > 0;
+  }
+  showLCD(
+    "HET TG QUET THE",
+    "THU LAI"
+  );
+  delay(1500);
+  return false;
+}
+void localAddFingerprint() {
+  if ( !fingerOK ) {
+    showLCD(
+      "AS608 DANG LOI",
+      "KHONG THE THEM"
+    );
+    delay(1800);
+    return;
+  }
+  String idText;
+  if (
+    !readAdminDigits(
+      "ID VT 1-127:",
+      idText,
+      1,
+      3,
+      false,
+      20000
+    )
+  ) {
+    return;
+  }
+  int id = idText.toInt();
+  if (
+    id < MIN_FINGER_ID
+    ||
+    id > MAX_FINGER_ID
+  ) {
+    showLCD(
+      "ID KHONG HOP LE",
+      "CHI 1 DEN 127"
+    );
+    delay(1800);
+    return;
+  }
+  enrollFingerprint(
+    (uint16_t)id
+  );
+  waitAdminResult();
+}
+void localDeleteFingerprint() {
+  if ( !fingerOK ) {
+    showLCD(
+      "AS608 DANG LOI",
+      "KHONG THE XOA"
+    );
+    delay(1800);
+    return;
+  }
+  String idText;
+  if (
+    !readAdminDigits(
+      "XOA ID VT:",
+      idText,
+      1,
+      3,
+      false,
+      20000
+    )
+  ) {
+    return;
+  }
+  int id = idText.toInt();
+  if (
+    id < MIN_FINGER_ID
+    ||
+    id > MAX_FINGER_ID
+  ) {
+    showLCD(
+      "ID KHONG HOP LE",
+      "CHI 1 DEN 127"
+    );
+    delay(1800);
+    return;
+  }
+  deleteFingerprint(
+    (uint16_t)id
+  );
+  waitAdminResult();
+}
+void localAddRfid() {
+  if ( allowedRfidCount >= MAX_RFID_CARDS ) {
+    showLCD(
+      "DANH SACH DAY",
+      "TOI DA 10 THE"
+    );
+    delay(1800);
+    return;
+  }
+  String uid;
+  if (
+    !scanRfidForAdmin(
+      uid,
+      20000
+    )
+  ) {
+    return;
+  }
+  if ( isRFIDAllowed(uid) ) {
+    showLCD(
+      "THE DA TON TAI",
+      uid
+    );
+    beepErrorShort();
+    delay(1800);
+    return;
+  }
+  if ( addAllowedRfid(uid) ) {
+    beepSuccess();
+    showLCD(
+      "DA THEM THE",
+      "TONG:" + String(allowedRfidCount)
+    );
+    delay(1800);
+  } else {
+    showLCD(
+      "THEM THE LOI",
+      "THU LAI"
+    );
+    beepErrorShort();
+    delay(1800);
+  }
+}
+void localDeleteRfid() {
+  if ( allowedRfidCount == 0 ) {
+    showLCD(
+      "KHONG CO THE",
+      "DE XOA"
+    );
+    delay(1800);
+    return;
+  }
+  String uid;
+  if (
+    !scanRfidForAdmin(
+      uid,
+      20000
+    )
+  ) {
+    return;
+  }
+  if ( !isRFIDAllowed(uid) ) {
+    showLCD(
+      "THE KHONG CO",
+      "TRONG DANH SACH"
+    );
+    beepErrorShort();
+    delay(1800);
+    return;
+  }
+  if ( deleteAllowedRfid(uid) ) {
+    beepSuccess();
+    showLCD(
+      "DA XOA THE",
+      "CON:" + String(allowedRfidCount)
+    );
+    delay(1800);
+  } else {
+    showLCD(
+      "XOA THE LOI",
+      "THU LAI"
+    );
+    beepErrorShort();
+    delay(1800);
+  }
+}
+void localChangePassword() {
+  String newPass1;
+  String newPass2;
+  if (
+    !readAdminDigits(
+      "MK MOI 4-12 SO:",
+      newPass1,
+      MIN_PASSWORD_LENGTH,
+      MAX_PASSWORD_LENGTH,
+      true,
+      20000
+    )
+  ) {
+    return;
+  }
+  showLCD(
+    "NHAP LAI MK",
+    "DE XAC NHAN"
+  );
+  delay(700);
+  if (
+    !readAdminDigits(
+      "NHAP LAI MK:",
+      newPass2,
+      MIN_PASSWORD_LENGTH,
+      MAX_PASSWORD_LENGTH,
+      true,
+      20000
+    )
+  ) {
+    return;
+  }
+  if ( newPass1 != newPass2 ) {
+    beepErrorShort();
+    showLCD(
+      "2 MK KHONG KHOP",
+      "KHONG DOI MK"
+    );
+    delay(1800);
+    return;
+  }
+  userPassword = newPass1;
+  saveUserPasswordToFlash();
+  beepSuccess();
+  showLCD(
+    "DA DOI MAT KHAU",
+    "THANH CONG"
+  );
+  delay(1800);
+}
+void localChangeAdminPassword() {
+  String newAdmin1;
+  String newAdmin2;
+  if (
+    !readAdminDigits(
+      "ADMIN 4-12 SO:",
+      newAdmin1,
+      MIN_PASSWORD_LENGTH,
+      MAX_PASSWORD_LENGTH,
+      true,
+      20000
+    )
+  ) {
+    return;
+  }
+  showLCD(
+    "NHAP LAI ADMIN",
+    "DE XAC NHAN"
+  );
+  delay(700);
+  if (
+    !readAdminDigits(
+      "NHAP LAI ADMIN",
+      newAdmin2,
+      MIN_PASSWORD_LENGTH,
+      MAX_PASSWORD_LENGTH,
+      true,
+      20000
+    )
+  ) {
+    return;
+  }
+  if ( newAdmin1 != newAdmin2 ) {
+    beepErrorShort();
+    showLCD(
+      "2 MK KHONG KHOP",
+      "KHONG DOI ADMIN"
+    );
+    delay(1800);
+    return;
+  }
+  adminPassword = newAdmin1;
+  saveAdminPasswordToFlash();
+  beepSuccess();
+  showLCD(
+    "DA DOI MK ADMIN",
+    "THANH CONG"
+  );
+  delay(1800);
+}
+void runLocalAdminMenu() {
+  networkDisplayState =
+    NET_DISPLAY_NONE;
+  systemState =
+    STATE_LOCAL_ADMIN;
+  inputBuffer = "";
+  lastKeyInputAt = 0;
+  resetFingerprintWaiting();
+  rfidCardLatched = false;
+  rfidMissingCount = 0;
+  showLCD(
+    "CHE DO QUAN TRI",
+    "NHAP MK + #"
+  );
+  unsigned long adminNoticeStartedAt = millis();
+  while (
+    millis() - adminNoticeStartedAt < 2000
+  ) {
+    serviceAdminBackground();
+  }
+  String adminPasswordInput;
+  if (
+    !readAdminDigits(
+      "NHAP MK QUAN TRI",
+      adminPasswordInput,
+      MIN_PASSWORD_LENGTH,
+      MAX_PASSWORD_LENGTH,
+      true,
+      20000
+    )
+  ) {
+    showLCD(
+      "HUY QUAN TRI",
+      "VE MAN HINH CHO"
+    );
+    delay(1000);
+    showWaitingScreen();
+    return;
+  }
+  if (
+    adminPasswordInput != adminPassword
+  ) {
+    beepErrorShort();
+    showLCD(
+      "SAI MAT KHAU",
+      "TU CHOI QUAN TRI"
+    );
+    delay(1800);
+    showWaitingScreen();
+    return;
+  }
+  beepSuccess();
+  showLCD(
+    "DANG NHAP DUNG",
+    "MENU QUAN TRI"
+  );
+  delay(1000);
+  while ( true ) {
+    systemState =
+      STATE_LOCAL_ADMIN;
+    char choice =
+      getAdminMenuChoice();
+    if ( choice == '0' ) {
+      showLCD(
+        "THOAT QUAN TRI",
+        "VE MAN HINH CHO"
+      );
+      delay(900);
+      break;
+    }
+    if ( choice == '1' ) {
+      localAddFingerprint();
+    }
+    else if ( choice == '2' ) {
+      localDeleteFingerprint();
+    }
+    else if ( choice == '3' ) {
+      localAddRfid();
+    }
+    else if ( choice == '4' ) {
+      localDeleteRfid();
+    }
+    else if ( choice == '5' ) {
+      localChangePassword();
+    }
+    else if ( choice == '6' ) {
+      localChangeAdminPassword();
+    }
+    systemState =
+      STATE_LOCAL_ADMIN;
+    inputBuffer = "";
+    lastKeyInputAt = 0;
+    resetFingerprintWaiting();
+    rfidCardLatched = false;
+    rfidMissingCount = 0;
+  }
+  stabilizeFingerprint();
+  showWaitingScreen();
 }
 void maintainSensors() {
   if ( systemState != STATE_WAITING ) {
@@ -1203,14 +1959,143 @@ void startMDNS() {
     Serial.println( "MDNS KHOI DONG THAT BAI" );
   }
 }
+void loadWiFiCredentials() {
+  WIFI_SSID = WIFI_DEFAULT_SSID;
+  WIFI_PASSWORD = WIFI_DEFAULT_PASSWORD;
+  Serial.println();
+  Serial.print( "WIFI NGOAI MAC DINH: " );
+  Serial.println( WIFI_SSID );
+}
+void startWiFiConfigPortal() {
+  if ( wifiConfigPortalActive ) {
+    return;
+  }
+  Serial.println();
+  Serial.println( "==============================" );
+  Serial.println( "BAT WIFI TRUC TIEP CUA ESP32" );
+  Serial.print( "TEN WIFI: " );
+  Serial.println( WIFI_SETUP_AP );
+  Serial.println( "MAT KHAU AP: 12345678" );
+  Serial.println( "IP ESP32 TRUC TIEP: http://192.168.4.1" );
+  Serial.println( "==============================" );
+  WiFi.mode( WIFI_AP_STA );
+  bool apOK = WiFi.softAP( WIFI_SETUP_AP, WIFI_SETUP_PASSWORD );
+  wifiConfigPortalActive = apOK;
+  Serial.print( "AP ESP32: " );
+  Serial.println( apOK ? "OK" : "LOI" );
+  Serial.print( "IP AP: " );
+  Serial.println( WiFi.softAPIP() );
+}
+void stopWiFiConfigPortal() {
+  return;
+}
+String wifiConfigHtml() {
+  String html =
+    "<!DOCTYPE html><html><head>"
+    "<meta charset='UTF-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>SmartDoor WiFi</title>"
+    "<style>"
+    "body{font-family:Arial;background:#f4f6f8;margin:0;padding:24px;}"
+    ".box{max-width:420px;margin:30px auto;background:white;padding:24px;"
+    "border-radius:16px;box-shadow:0 4px 18px #0002;}"
+    "h2{margin-top:0;}label{display:block;margin-top:14px;font-weight:bold;}"
+    "input{width:100%;box-sizing:border-box;padding:12px;margin-top:6px;"
+    "border:1px solid #bbb;border-radius:9px;font-size:16px;}"
+    "button{width:100%;margin-top:20px;padding:13px;border:0;border-radius:9px;"
+    "font-size:16px;font-weight:bold;background:#1f6feb;color:white;}"
+    ".note{font-size:13px;color:#555;line-height:1.45;}"
+    "</style></head><body><div class='box'>"
+    "<h2>SMART DOOR - WIFI</h2>"
+    "<p class='note'>Dien thoai dang ket noi truc tiep voi ESP32. Neu muon, nhap them WiFi/hotspot ma ESP32 se ket noi. "
+    "Thong tin se duoc luu trong bo nho ESP32.</p>"
+    "<form method='POST' action='/save-wifi'>"
+    "<label>Ten WiFi (SSID)</label>"
+    "<input name='ssid' maxlength='32' required placeholder='Vi du: DATN-Hoan'>"
+    "<label>Mat khau WiFi</label>"
+    "<input name='pass' type='password' maxlength='64' placeholder='De trong neu WiFi khong co mat khau'>"
+    "<button type='submit'>LUU VA KET NOI</button>"
+    "</form></div></body></html>";
+  return html;
+}
+void handleWiFiConfigPage() {
+  if ( !wifiConfigPortalActive ) {
+    server.send( 200, "text/plain; charset=utf-8", "SmartDoor API dang hoat dong" );
+    return;
+  }
+  server.send( 200, "text/html; charset=utf-8", wifiConfigHtml() );
+}
+void handleWiFiConfigSave() {
+  if ( !wifiConfigPortalActive ) {
+    server.send( 403, "text/plain; charset=utf-8", "Che do cau hinh WiFi dang tat" );
+    return;
+  }
+  String newSsid = server.arg( "ssid" );
+  String newPass = server.arg( "pass" );
+  newSsid.trim();
+  if ( newSsid.length() == 0 ) {
+    server.send(
+      400,
+      "text/html; charset=utf-8",
+      "<h3>SSID khong duoc de trong.</h3><a href='/'>Quay lai</a>"
+    );
+    return;
+  }
+  prefs.putString( "wifi_ssid", newSsid );
+  prefs.putString( "wifi_pass", newPass );
+  Serial.println();
+  Serial.println( "DA LUU WIFI MOI" );
+  Serial.print( "SSID: " );
+  Serial.println( newSsid );
+  server.send(
+    200,
+    "text/html; charset=utf-8",
+    "<html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "</head><body style='font-family:Arial;padding:30px'>"
+    "<h2>Da luu WiFi.</h2>"
+    "<p>ESP32 se khoi dong lai. Hay bat hotspot/WiFi vua nhap neu chua bat.</p>"
+    "</body></html>"
+  );
+  delay( 1200 );
+  ESP.restart();
+}
+void showAPCredentialsAtBoot() {
+  if ( !lcdOK || !wifiConfigPortalActive ) {
+    return;
+  }
+  showLCD( WIFI_SETUP_AP, String("PASS:") + WIFI_SETUP_PASSWORD );
+  Serial.println();
+  Serial.println( "HIEN THI THONG TIN WIFI ESP32 TRONG 3 GIAY" );
+  Serial.print( "SSID: " );
+  Serial.println( WIFI_SETUP_AP );
+  Serial.print( "PASSWORD: " );
+  Serial.println( WIFI_SETUP_PASSWORD );
+  unsigned long started = millis();
+  while ( millis() - started < 3000 ) {
+    feedWatchdog();
+    if ( webServerStarted ) {
+      server.handleClient();
+    }
+    delay(10);
+  }
+}
 void setupWiFi() {
-  WiFi.mode( WIFI_STA );
+  loadWiFiCredentials();
+  startWiFiConfigPortal();
   WiFi.setAutoReconnect( true );
-  WiFi.persistent( true );
-  WiFi.begin( WIFI_SSID, WIFI_PASSWORD );
+  WiFi.persistent( false );
+  if ( WIFI_SSID.length() == 0 ) {
+    wasWiFiConnected = false;
+    mdnsOK = false;
+    Serial.println( "CHUA CO WIFI STA DA LUU - CHI CHAY AP TRUC TIEP" );
+    startMDNS();
+    return;
+  }
+  WiFi.mode( WIFI_AP_STA );
+  WiFi.begin( WIFI_SSID.c_str(), WIFI_PASSWORD.c_str() );
   unsigned long started = millis();
   while ( WiFi.status() != WL_CONNECTED &&
-          millis() - started < 20000 ) {
+          millis() - started < 12000 ) {
     feedWatchdog();
     Serial.print(".");
     delay(500);
@@ -1218,9 +2103,11 @@ void setupWiFi() {
   Serial.println();
   if ( WiFi.status() == WL_CONNECTED ) {
     wasWiFiConnected = true;
-    Serial.println( "WIFI KET NOI OK" );
-    Serial.print( "IP ESP32: " );
+    Serial.println( "WIFI STA KET NOI OK" );
+    Serial.print( "IP STA ESP32: " );
     Serial.println( WiFi.localIP() );
+    Serial.print( "IP AP ESP32: " );
+    Serial.println( WiFi.softAPIP() );
     startMDNS();
     configTime(
       7 * 3600,
@@ -1232,18 +2119,10 @@ void setupWiFi() {
   else {
     wasWiFiConnected = false;
     mdnsOK = false;
-    Serial.println(
-      "WIFI LOI - CHAY OFFLINE"
-    );
-    showLCD(
-      "KHONG CO KET NOI",
-      "WIFI"
-    );
-    unsigned long noWifiStart = millis();
-    while ( millis() - noWifiStart < 3000 ) {
-      feedWatchdog();
-      delay(20);
-    }
+    Serial.println( "KHONG KET NOI DUOC WIFI STA DA LUU" );
+    Serial.println( "AP SmartDoor_Direct VAN HOAT DONG" );
+    Serial.println( "DIEN THOAI CO THE KET NOI SMARTDOOR_DIRECT VA MO APP" );
+    startMDNS();
   }
 }
 void maintainWiFi() {
@@ -1253,49 +2132,106 @@ void maintainWiFi() {
     stabilizeFingerprint();
     Serial.println();
     Serial.println( "==============================" );
-    Serial.println( "WIFI DA KET NOI LAI" );
-    Serial.print( "IP MOI ESP32: " );
+    Serial.println( "WIFI STA DA KET NOI LAI" );
+    Serial.print( "IP STA: " );
     Serial.println( WiFi.localIP() );
+    Serial.print( "IP AP TRUC TIEP: " );
+    Serial.println( WiFi.softAPIP() );
     mdnsOK = false;
     startMDNS();
     Serial.print( "MDNS: " );
     Serial.println( mdnsOK ? "smartdoor.local" : "LOI" );
     Serial.println( "==============================" );
-    if ( systemState == STATE_WAITING ) {
-      showLCD( "KET NOI LAI WIFI", "" );
-      networkDisplayState = NET_DISPLAY_RECONNECTED_IP;
-      networkDisplayStartedAt = millis();
-    }
     return;
   }
-  if (connected) {
+  if ( connected ) {
     wasWiFiConnected = true;
     return;
   }
   if ( wasWiFiConnected ) {
     wasWiFiConnected = false;
-    mdnsOK = false;
     stabilizeFingerprint();
     Serial.println();
     Serial.println( "==============================" );
-    Serial.println( "WIFI DA MAT" );
-    Serial.println( "CHUYEN SANG OFFLINE MODE" );
+    Serial.println( "WIFI STA DA MAT" );
+    Serial.println( "AP SmartDoor_Direct VAN HOAT DONG" );
     Serial.println( "VT / RFID / MAT KHAU VAN HOAT DONG" );
+    Serial.println( "APP CO THE KET NOI AP 192.168.4.1" );
     Serial.println( "==============================" );
-    if ( systemState == STATE_WAITING ) {
-      showLCD( "MAT KET NOI WIFI", "OFFLINE MODE" );
-      networkDisplayState = NET_DISPLAY_WIFI_LOST;
-      networkDisplayStartedAt = millis();
-    }
+  }
+  if ( !wifiConfigPortalActive ) {
+    startWiFiConfigPortal();
+  }
+  if ( WIFI_SSID.length() == 0 ) {
+    return;
   }
   if ( millis() - lastWiFiReconnectAt < WIFI_RECONNECT_INTERVAL ) {
     return;
   }
   lastWiFiReconnectAt = millis();
-  Serial.println( "DANG THU KET NOI LAI WIFI..." );
-  WiFi.disconnect();
+  Serial.println( "DANG THU KET NOI LAI WIFI STA DA LUU..." );
+  WiFi.disconnect( false, false );
   delay(100);
-  WiFi.begin( WIFI_SSID, WIFI_PASSWORD );
+  WiFi.mode( WIFI_AP_STA );
+  WiFi.begin( WIFI_SSID.c_str(), WIFI_PASSWORD.c_str() );
+}
+void maintainAPClients() {
+  if ( !wifiConfigPortalActive ) {
+    previousAPClientCount = 0;
+    return;
+  }
+  uint8_t currentAPClientCount = WiFi.softAPgetStationNum();
+  if ( currentAPClientCount > previousAPClientCount ) {
+    Serial.println();
+    Serial.println( "==============================" );
+    Serial.println( "THIET BI DA KET NOI SMARTDOOR_DIRECT" );
+    Serial.print( "SO THIET BI AP: " );
+    Serial.println( currentAPClientCount );
+    Serial.println( "CHO APP GUI API HEARTBEAT..." );
+    Serial.println( "==============================" );
+  }
+  if ( currentAPClientCount < previousAPClientCount ) {
+    Serial.print( "THIET BI NGAT SMARTDOOR_DIRECT - CON LAI: " );
+    Serial.println( currentAPClientCount );
+  }
+  previousAPClientCount = currentAPClientCount;
+}
+void noteAppContact() {
+  lastAppContactAt = millis();
+}
+void updateAppConnectionState() {
+  bool nowConnected =
+    ( lastAppContactAt != 0 ) &&
+    ( millis() - lastAppContactAt <= APP_CONNECTION_TIMEOUT );
+  if ( nowConnected && !appConnected ) {
+    appConnected = true;
+    Serial.println();
+    Serial.println( "==============================" );
+    Serial.println( "APP DA KET NOI LAI" );
+    Serial.println( "NHAN DUOC HEARTBEAT/API REQUEST" );
+    Serial.println( "==============================" );
+    if ( systemState == STATE_WAITING ) {
+      showLCD( "DA KET NOI LAI", "APP SAN SANG" );
+      networkDisplayState = NET_DISPLAY_RECONNECTED_IP;
+      networkDisplayStartedAt = millis();
+    }
+    return;
+  }
+  if ( !nowConnected && appConnected ) {
+    appConnected = false;
+    Serial.println();
+    Serial.println( "==============================" );
+    Serial.println( "APP DA MAT KET NOI" );
+    Serial.println( "KHONG CON HEARTBEAT/API REQUEST" );
+    Serial.println( "==============================" );
+    if ( systemState == STATE_WAITING ) {
+      showLCD( "APP MAT KET NOI", "CHE DO OFFLINE" );
+      networkDisplayState = NET_DISPLAY_APP_LOST;
+      networkDisplayStartedAt = millis();
+    }
+    return;
+  }
+  appConnected = nowConnected;
 }
 void updateNetworkDisplay() {
   if ( networkDisplayState == NET_DISPLAY_NONE ) {
@@ -1307,7 +2243,7 @@ void updateNetworkDisplay() {
     return;
   }
   unsigned long elapsed = millis() - networkDisplayStartedAt;
-  if ( networkDisplayState == NET_DISPLAY_WIFI_LOST ) {
+  if ( networkDisplayState == NET_DISPLAY_APP_LOST ) {
     if ( elapsed >= WIFI_LOST_DISPLAY_TIME ) {
       networkDisplayState = NET_DISPLAY_NONE;
       updateLCDByState();
@@ -1343,6 +2279,7 @@ void sendBusyResponse() {
   sendJson( 409, json );
 }
 void handleApiStatus() {
+  noteAppContact();
   apiRequestCount++;
   String json = "{";
   json += "\"success\":true,";
@@ -1406,6 +2343,7 @@ void handleApiStatus() {
   sendJson( 200, json );
 }
 void handleApiOpenDoor() {
+  noteAppContact();
   apiRequestCount++;
   if ( systemState == STATE_LOCKOUT ) {
     sendJson( 423, "{\"success\":false," "\"message\":\"He thong dang khoa tam 5 giay\"}" );
@@ -1420,26 +2358,22 @@ void handleApiOpenDoor() {
   sendJson( 200, "{\"success\":true," "\"message\":\"Da mo cua\"}" );
 }
 void handleApiLockDoor() {
+  noteAppContact();
   apiRequestCount++;
   networkDisplayState = NET_DISPLAY_NONE;
-
-  // Chi cho phep lenh khoa tu app khi cua dang o trang thai mo.
-  // Tranh lam thay doi state khi dang quet RFID, van tay,
-  // nhap mat khau, dang ky/xoa van tay hoac dang lockout.
   if (systemState != STATE_DOOR_OPEN) {
     sendJson(409,
              "{\"success\":false,"
              "\"message\":\"Cua khong o trang thai mo\"}");
     return;
   }
-
   lockDoor();
-
   sendJson(200,
            "{\"success\":true,"
            "\"message\":\"Da khoa cua\"}");
 }
 void handleApiFingerprintCount() {
+  noteAppContact();
   apiRequestCount++;
   if (!fingerOK) {
     sendJson( 503, "{\"success\":false," "\"message\":\"AS608 khong ket noi\"," "\"count\":0}" );
@@ -1453,6 +2387,7 @@ void handleApiFingerprintCount() {
   sendJson( 200, json );
 }
 void handleApiEnrollFingerprint() {
+  noteAppContact();
   apiRequestCount++;
   if ( systemState == STATE_LOCKOUT ) {
     sendJson( 423, "{\"success\":false," "\"message\":\"He thong dang khoa tam\"}" );
@@ -1527,6 +2462,7 @@ void handleApiEnrollFingerprint() {
   sendJson( 500, "{\"success\":false," "\"message\":\"Dang ky van tay that bai\"}" );
 }
 void handleApiDeleteFingerprint() {
+  noteAppContact();
   apiRequestCount++;
   if ( systemState == STATE_LOCKOUT ) {
     sendJson( 423, "{\"success\":false," "\"message\":\"He thong dang khoa tam\"}" );
@@ -1584,6 +2520,7 @@ void handleApiDeleteFingerprint() {
   }
 }
 void handleApiHistory() {
+  noteAppContact();
   apiRequestCount++;
   String json = "{";
   json += "\"success\":true,";
@@ -1628,6 +2565,10 @@ void setupWebServer() {
     Serial.println( WiFi.localIP() );
     Serial.println( "HOST: http://smartdoor.local" );
   }
+  if ( wifiConfigPortalActive ) {
+    Serial.println( "AP TRUC TIEP: SmartDoor_Direct" );
+    Serial.println( "API TRUC TIEP: http://192.168.4.1" );
+  }
 }
 void setup() {
   pinMode( RELAY_LOCK_PIN, OUTPUT );
@@ -1643,6 +2584,7 @@ void setup() {
   setupWatchdog();
   feedWatchdog();
   prefs.begin( "smartdoor", false );
+  loadSecurityConfig();
   loadHistoryFromFlash();
   feedWatchdog();
   setupKeypad();
@@ -1670,11 +2612,20 @@ void setup() {
   setupWiFi();
   feedWatchdog();
   setupWebServer();
+  showAPCredentialsAtBoot();
   digitalWrite( RELAY_LOCK_PIN, DOOR_LOCK_LEVEL );
   stopBuzzer();
   failedAttempts = 0;
-  networkDisplayState = NET_DISPLAY_NONE;
-  showWaitingScreen();
+  lastAppContactAt = 0;
+  appConnected = false;
+  systemState = STATE_WAITING;
+  inputBuffer = "";
+  lastKeyInputAt = 0;
+  currentDoorMethod = "";
+  resetFingerprintWaiting();
+  showLCD( "APP MAT KET NOI", "CHE DO OFFLINE" );
+  networkDisplayState = NET_DISPLAY_APP_LOST;
+  networkDisplayStartedAt = millis();
   Serial.println();
   Serial.println( "=================================" );
   Serial.println( "HE THONG SAN SANG" );
@@ -1685,6 +2636,11 @@ void setup() {
   Serial.println( rfidOK ? "OK" : "LOI" );
   Serial.print( "WIFI: " );
   Serial.println( WiFi.status() == WL_CONNECTED ? "OK" : "OFFLINE" );
+  if ( wifiConfigPortalActive ) {
+    Serial.println( "AP TRUC TIEP: SmartDoor_Direct" );
+    Serial.println( "MAT KHAU AP: 12345678" );
+    Serial.println( "IP AP: http://192.168.4.1" );
+  }
   Serial.print( "MDNS: " );
   Serial.println( mdnsOK ? "OK" : "LOI" );
   if ( WiFi.status() == WL_CONNECTED ) {
@@ -1694,6 +2650,8 @@ void setup() {
   }
   Serial.print( "SO VAN TAY: " );
   Serial.println( cachedFingerprintCount );
+  Serial.print( "SO THE RFID: " );
+  Serial.println( allowedRfidCount );
   Serial.print( "SO HISTORY: " );
   Serial.println( doorHistoryCount );
   Serial.print( "STATE: " );
@@ -1703,11 +2661,13 @@ void setup() {
 void loop() {
   feedWatchdog();
   maintainWiFi();
-  updateNetworkDisplay();
+  maintainAPClients();
   maintainSensors();
-  if ( webServerStarted && WiFi.status() == WL_CONNECTED ) {
+  if ( webServerStarted && ( WiFi.status() == WL_CONNECTED || wifiConfigPortalActive ) ) {
     server.handleClient();
   }
+  updateAppConnectionState();
+  updateNetworkDisplay();
   updateLockout();
   updateDoor();
   updateBuzzer();
