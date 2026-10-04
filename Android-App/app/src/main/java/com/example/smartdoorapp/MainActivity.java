@@ -103,23 +103,6 @@ public class MainActivity extends AppCompatActivity {
     private boolean discoveryInProgress = false;
 
     // =====================================================
-    // KET NOI TRUC TIEP VOI WIFI DO ESP32 PHAT
-    // =====================================================
-
-    // Khi dien thoai ket noi WiFi "SmartDoor_Direct",
-    // ESP32 SoftAP luon co dia chi nay.
-    private static final String DIRECT_AP_IP =
-            "192.168.4.1";
-
-    private static final int DIRECT_AP_PORT =
-            80;
-
-    // Tranh gui nhieu request thu 192.168.4.1 cung luc.
-    private boolean directProbeInProgress =
-            false;
-
-
-    // =====================================================
     // HANDLER RECONNECT
     // =====================================================
 
@@ -632,142 +615,6 @@ public class MainActivity extends AppCompatActivity {
 
 
     // =====================================================
-    // THU KET NOI TRUC TIEP 192.168.4.1
-    // =====================================================
-
-    private void tryDirectEspConnection() {
-
-        if (
-                api != null
-                        ||
-                        directProbeInProgress
-        ) {
-
-            return;
-        }
-
-
-        directProbeInProgress =
-                true;
-
-
-        /*
-         * Khong gan ngay vao bien api.
-         * Chi khi /api/status cua 192.168.4.1 tra loi thanh cong
-         * moi coi day la ESP32 cua he thong.
-         */
-        RetrofitClient.reset();
-
-        final SmartDoorApi directApi =
-                RetrofitClient.getApi(
-                        DIRECT_AP_IP,
-                        DIRECT_AP_PORT
-                );
-
-
-        directApi.getStatus().enqueue(
-
-                new Callback<StatusResponse>() {
-
-                    @Override
-                    public void onResponse(
-                            Call<StatusResponse> call,
-                            Response<StatusResponse> response
-                    ) {
-
-                        directProbeInProgress =
-                                false;
-
-
-                        // Neu NSD da tim duoc ESP32 truoc thi giu ket noi do.
-                        if (
-                                api != null
-                        ) {
-
-                            return;
-                        }
-
-
-                        if (
-                                response.isSuccessful()
-                                        &&
-                                        response.body() != null
-                        ) {
-
-                            stopDiscovery();
-
-                            discoveryInProgress =
-                                    false;
-
-
-                            reconnectHandler.removeCallbacks(
-                                    reconnectRunnable
-                            );
-
-
-                            currentEspIp =
-                                    DIRECT_AP_IP;
-
-                            currentEspPort =
-                                    DIRECT_AP_PORT;
-
-
-                            /*
-                             * Tao lai API chinh thuc cho ket noi SoftAP.
-                             */
-                            RetrofitClient.reset();
-
-                            api =
-                                    RetrofitClient.getApi(
-                                            currentEspIp,
-                                            currentEspPort
-                                    );
-
-
-                            showConnectionSearching();
-
-
-                            tvIp.setText(
-                                    "IP ESP32: "
-                                            +
-                                            DIRECT_AP_IP
-                                            +
-                                            " (WiFi ESP32)"
-                            );
-
-
-                            tvMessage.setText(
-                                    "Đã kết nối trực tiếp SmartDoor_Direct."
-                            );
-
-
-                            refreshAll();
-                        }
-                    }
-
-
-                    @Override
-                    public void onFailure(
-                            Call<StatusResponse> call,
-                            Throwable t
-                    ) {
-
-                        /*
-                         * 192.168.4.1 khong truy cap duoc:
-                         * khong bao loi ngay.
-                         *
-                         * NSD van dang chay song song de tim ESP32
-                         * neu dien thoai va ESP32 dang o cung WiFi ngoai.
-                         */
-                        directProbeInProgress =
-                                false;
-                    }
-                }
-        );
-    }
-
-
-    // =====================================================
     // START DISCOVERY
     // =====================================================
 
@@ -791,14 +638,6 @@ public class MainActivity extends AppCompatActivity {
 
         discoveryInProgress =
                 true;
-
-
-        /*
-         * Thu duong truc tiep cua SoftAP truoc/song song.
-         * Neu dien thoai dang bat SmartDoor_Direct,
-         * dia chi 192.168.4.1 se tra loi ngay.
-         */
-        tryDirectEspConnection();
 
 
         showConnectionSearching();
@@ -850,7 +689,7 @@ public class MainActivity extends AppCompatActivity {
 
 
                                             tvMessage.setText(
-                                                    "Đang tìm ESP32 trong mạng hotspot..."
+                                                    "Đang tìm ESP32 trong mạng WiFi chung..."
                                             );
                                         }
                                 );
@@ -869,20 +708,6 @@ public class MainActivity extends AppCompatActivity {
 
                                 runOnUiThread(
                                         () -> {
-
-                                            // Neu da ket noi truc tiep 192.168.4.1
-                                            // thi khong de NSD ghi de ket noi.
-                                            if (
-                                                    api != null
-                                                            &&
-                                                            DIRECT_AP_IP.equals(
-                                                                    currentEspIp
-                                                            )
-                                            ) {
-
-                                                return;
-                                            }
-
 
                                             discoveryInProgress =
                                                     false;
@@ -943,18 +768,6 @@ public class MainActivity extends AppCompatActivity {
 
                                 runOnUiThread(
                                         () -> {
-
-                                            // NSD co the bao LOST khi ta dung discovery,
-                                            // nhung neu dang noi truc tiep SoftAP thi bo qua.
-                                            if (
-                                                    DIRECT_AP_IP.equals(
-                                                            currentEspIp
-                                                    )
-                                            ) {
-
-                                                return;
-                                            }
-
 
                                             if (
                                                     api == null
@@ -1117,9 +930,6 @@ public class MainActivity extends AppCompatActivity {
                 null;
 
 
-        directProbeInProgress =
-                false;
-
         discoveryInProgress =
                 false;
 
@@ -1248,23 +1058,8 @@ public class MainActivity extends AppCompatActivity {
                                     data.getIp();
 
 
-                            /*
-                             * Neu app dang ket noi truc tiep SoftAP,
-                             * giu nguyen 192.168.4.1.
-                             *
-                             * ESP32 co the tra ve IP cua WiFi ngoai trong JSON,
-                             * nhung do KHONG phai duong app dang su dung.
-                             */
-                            boolean usingDirectAp =
-                                    DIRECT_AP_IP.equals(
-                                            currentEspIp
-                                    );
-
-
                             if (
-                                    !usingDirectAp
-                                            &&
-                                            responseIp != null
+                                    responseIp != null
                                             &&
                                             !responseIp
                                                     .trim()
@@ -1293,29 +1088,13 @@ public class MainActivity extends AppCompatActivity {
                             }
 
 
-                            if (
-                                    usingDirectAp
-                            ) {
-
-                                tvIp.setText(
-                                        "IP ESP32: "
-                                                +
-                                                ipToDisplay
-                                                +
-                                                " (WiFi ESP32)"
-                                );
-                            }
-
-                            else {
-
-                                tvIp.setText(
-                                        "IP ESP32: "
-                                                +
-                                                ipToDisplay
-                                                +
-                                                " (WiFi chung)"
-                                );
-                            }
+                            tvIp.setText(
+                                    "IP ESP32: "
+                                            +
+                                            ipToDisplay
+                                            +
+                                            " (WiFi chung)"
+                            );
 
 
                             if (
@@ -1341,21 +1120,9 @@ public class MainActivity extends AppCompatActivity {
                             );
 
 
-                            if (
-                                    usingDirectAp
-                            ) {
-
-                                tvMessage.setText(
-                                        "Đã kết nối trực tiếp với SmartDoor_Direct."
-                                );
-                            }
-
-                            else {
-
-                                tvMessage.setText(
-                                        "Smart Door đã kết nối qua WiFi chung."
-                                );
-                            }
+                            tvMessage.setText(
+                                    "Smart Door đã kết nối qua WiFi chung."
+                            );
                         }
 
                         else {
