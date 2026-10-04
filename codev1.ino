@@ -11,15 +11,11 @@
 #include <hd44780ioClass/hd44780_I2Cexp.h>
 #include <esp_task_wdt.h>
 #include <esp_arduino_version.h>
-const char* WIFI_DEFAULT_SSID = "NGUYEN HIEP";
-const char* WIFI_DEFAULT_PASSWORD = "07012012";
+const char* WIFI_DEFAULT_SSID = "Dungcomadua";
+const char* WIFI_DEFAULT_PASSWORD = "11092004";
 String WIFI_SSID = WIFI_DEFAULT_SSID;
 String WIFI_PASSWORD = WIFI_DEFAULT_PASSWORD;
-const char* WIFI_SETUP_AP = "SmartDoor_Direct";
-const char* WIFI_SETUP_PASSWORD = "12345678";
 const char* MDNS_HOSTNAME = "smartdoor";
-bool wifiConfigPortalActive = false;
-uint8_t previousAPClientCount = 0;
 const unsigned long APP_CONNECTION_TIMEOUT = 5000;
 unsigned long lastAppContactAt = 0;
 bool appConnected = false;
@@ -1292,11 +1288,7 @@ void serviceAdminBackground() {
   if (
     webServerStarted
     &&
-    (
-      WiFi.status() == WL_CONNECTED
-      ||
-      wifiConfigPortalActive
-    )
+    WiFi.status() == WL_CONNECTED
   ) {
     server.handleClient();
   }
@@ -1960,154 +1952,47 @@ void startMDNS() {
   }
 }
 void loadWiFiCredentials() {
-  WIFI_SSID = WIFI_DEFAULT_SSID;
-  WIFI_PASSWORD = WIFI_DEFAULT_PASSWORD;
+  WIFI_SSID = prefs.getString( "wifi_ssid", WIFI_DEFAULT_SSID );
+  WIFI_PASSWORD = prefs.getString( "wifi_pass", WIFI_DEFAULT_PASSWORD );
   Serial.println();
-  Serial.print( "WIFI NGOAI MAC DINH: " );
+  Serial.print( "WIFI SSID: " );
   Serial.println( WIFI_SSID );
-}
-void startWiFiConfigPortal() {
-  if ( wifiConfigPortalActive ) {
-    return;
-  }
-  Serial.println();
-  Serial.println( "==============================" );
-  Serial.println( "BAT WIFI TRUC TIEP CUA ESP32" );
-  Serial.print( "TEN WIFI: " );
-  Serial.println( WIFI_SETUP_AP );
-  Serial.println( "MAT KHAU AP: 12345678" );
-  Serial.println( "IP ESP32 TRUC TIEP: http://192.168.4.1" );
-  Serial.println( "==============================" );
-  WiFi.mode( WIFI_AP_STA );
-  bool apOK = WiFi.softAP( WIFI_SETUP_AP, WIFI_SETUP_PASSWORD );
-  wifiConfigPortalActive = apOK;
-  Serial.print( "AP ESP32: " );
-  Serial.println( apOK ? "OK" : "LOI" );
-  Serial.print( "IP AP: " );
-  Serial.println( WiFi.softAPIP() );
-}
-void stopWiFiConfigPortal() {
-  return;
-}
-String wifiConfigHtml() {
-  String html =
-    "<!DOCTYPE html><html><head>"
-    "<meta charset='UTF-8'>"
-    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>SmartDoor WiFi</title>"
-    "<style>"
-    "body{font-family:Arial;background:#f4f6f8;margin:0;padding:24px;}"
-    ".box{max-width:420px;margin:30px auto;background:white;padding:24px;"
-    "border-radius:16px;box-shadow:0 4px 18px #0002;}"
-    "h2{margin-top:0;}label{display:block;margin-top:14px;font-weight:bold;}"
-    "input{width:100%;box-sizing:border-box;padding:12px;margin-top:6px;"
-    "border:1px solid #bbb;border-radius:9px;font-size:16px;}"
-    "button{width:100%;margin-top:20px;padding:13px;border:0;border-radius:9px;"
-    "font-size:16px;font-weight:bold;background:#1f6feb;color:white;}"
-    ".note{font-size:13px;color:#555;line-height:1.45;}"
-    "</style></head><body><div class='box'>"
-    "<h2>SMART DOOR - WIFI</h2>"
-    "<p class='note'>Dien thoai dang ket noi truc tiep voi ESP32. Neu muon, nhap them WiFi/hotspot ma ESP32 se ket noi. "
-    "Thong tin se duoc luu trong bo nho ESP32.</p>"
-    "<form method='POST' action='/save-wifi'>"
-    "<label>Ten WiFi (SSID)</label>"
-    "<input name='ssid' maxlength='32' required placeholder='Vi du: DATN-Hoan'>"
-    "<label>Mat khau WiFi</label>"
-    "<input name='pass' type='password' maxlength='64' placeholder='De trong neu WiFi khong co mat khau'>"
-    "<button type='submit'>LUU VA KET NOI</button>"
-    "</form></div></body></html>";
-  return html;
-}
-void handleWiFiConfigPage() {
-  if ( !wifiConfigPortalActive ) {
-    server.send( 200, "text/plain; charset=utf-8", "SmartDoor API dang hoat dong" );
-    return;
-  }
-  server.send( 200, "text/html; charset=utf-8", wifiConfigHtml() );
-}
-void handleWiFiConfigSave() {
-  if ( !wifiConfigPortalActive ) {
-    server.send( 403, "text/plain; charset=utf-8", "Che do cau hinh WiFi dang tat" );
-    return;
-  }
-  String newSsid = server.arg( "ssid" );
-  String newPass = server.arg( "pass" );
-  newSsid.trim();
-  if ( newSsid.length() == 0 ) {
-    server.send(
-      400,
-      "text/html; charset=utf-8",
-      "<h3>SSID khong duoc de trong.</h3><a href='/'>Quay lai</a>"
-    );
-    return;
-  }
-  prefs.putString( "wifi_ssid", newSsid );
-  prefs.putString( "wifi_pass", newPass );
-  Serial.println();
-  Serial.println( "DA LUU WIFI MOI" );
-  Serial.print( "SSID: " );
-  Serial.println( newSsid );
-  server.send(
-    200,
-    "text/html; charset=utf-8",
-    "<html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "</head><body style='font-family:Arial;padding:30px'>"
-    "<h2>Da luu WiFi.</h2>"
-    "<p>ESP32 se khoi dong lai. Hay bat hotspot/WiFi vua nhap neu chua bat.</p>"
-    "</body></html>"
-  );
-  delay( 1200 );
-  ESP.restart();
-}
-void showAPCredentialsAtBoot() {
-  if ( !lcdOK || !wifiConfigPortalActive ) {
-    return;
-  }
-  showLCD( WIFI_SETUP_AP, String("PASS:") + WIFI_SETUP_PASSWORD );
-  Serial.println();
-  Serial.println( "HIEN THI THONG TIN WIFI ESP32 TRONG 3 GIAY" );
-  Serial.print( "SSID: " );
-  Serial.println( WIFI_SETUP_AP );
-  Serial.print( "PASSWORD: " );
-  Serial.println( WIFI_SETUP_PASSWORD );
-  unsigned long started = millis();
-  while ( millis() - started < 3000 ) {
-    feedWatchdog();
-    if ( webServerStarted ) {
-      server.handleClient();
-    }
-    delay(10);
-  }
 }
 void setupWiFi() {
   loadWiFiCredentials();
-  startWiFiConfigPortal();
+  WiFi.mode( WIFI_STA );
   WiFi.setAutoReconnect( true );
   WiFi.persistent( false );
+
   if ( WIFI_SSID.length() == 0 ) {
     wasWiFiConnected = false;
     mdnsOK = false;
-    Serial.println( "CHUA CO WIFI STA DA LUU - CHI CHAY AP TRUC TIEP" );
-    startMDNS();
+    Serial.println( "CHUA CO WIFI STA - HE THONG CHAY OFFLINE" );
     return;
   }
-  WiFi.mode( WIFI_AP_STA );
+
+  Serial.println();
+  Serial.println( "==============================" );
+  Serial.println( "KET NOI WIFI STA" );
+  Serial.print( "SSID: " );
+  Serial.println( WIFI_SSID );
+  Serial.println( "==============================" );
+
   WiFi.begin( WIFI_SSID.c_str(), WIFI_PASSWORD.c_str() );
   unsigned long started = millis();
   while ( WiFi.status() != WL_CONNECTED &&
           millis() - started < 12000 ) {
     feedWatchdog();
-    Serial.print(".");
-    delay(500);
+    Serial.print( "." );
+    delay( 500 );
   }
   Serial.println();
+
   if ( WiFi.status() == WL_CONNECTED ) {
     wasWiFiConnected = true;
     Serial.println( "WIFI STA KET NOI OK" );
-    Serial.print( "IP STA ESP32: " );
+    Serial.print( "IP ESP32: " );
     Serial.println( WiFi.localIP() );
-    Serial.print( "IP AP ESP32: " );
-    Serial.println( WiFi.softAPIP() );
     startMDNS();
     configTime(
       7 * 3600,
@@ -2115,28 +2000,24 @@ void setupWiFi() {
       "pool.ntp.org",
       "time.google.com"
     );
-  }
-  else {
+  } else {
     wasWiFiConnected = false;
     mdnsOK = false;
-    Serial.println( "KHONG KET NOI DUOC WIFI STA DA LUU" );
-    Serial.println( "AP SmartDoor_Direct VAN HOAT DONG" );
-    Serial.println( "DIEN THOAI CO THE KET NOI SMARTDOOR_DIRECT VA MO APP" );
-    startMDNS();
+    Serial.println( "KHONG KET NOI DUOC WIFI STA" );
+    Serial.println( "ESP32 SE TU DONG THU KET NOI LAI" );
   }
 }
 void maintainWiFi() {
   bool connected = WiFi.status() == WL_CONNECTED;
+
   if ( connected && !wasWiFiConnected ) {
     wasWiFiConnected = true;
     stabilizeFingerprint();
     Serial.println();
     Serial.println( "==============================" );
     Serial.println( "WIFI STA DA KET NOI LAI" );
-    Serial.print( "IP STA: " );
+    Serial.print( "IP ESP32: " );
     Serial.println( WiFi.localIP() );
-    Serial.print( "IP AP TRUC TIEP: " );
-    Serial.println( WiFi.softAPIP() );
     mdnsOK = false;
     startMDNS();
     Serial.print( "MDNS: " );
@@ -2144,57 +2025,38 @@ void maintainWiFi() {
     Serial.println( "==============================" );
     return;
   }
+
   if ( connected ) {
     wasWiFiConnected = true;
     return;
   }
+
   if ( wasWiFiConnected ) {
     wasWiFiConnected = false;
+    mdnsOK = false;
     stabilizeFingerprint();
     Serial.println();
     Serial.println( "==============================" );
     Serial.println( "WIFI STA DA MAT" );
-    Serial.println( "AP SmartDoor_Direct VAN HOAT DONG" );
-    Serial.println( "VT / RFID / MAT KHAU VAN HOAT DONG" );
-    Serial.println( "APP CO THE KET NOI AP 192.168.4.1" );
+    Serial.println( "KHONG CO AP TRUC TIEP TU ESP32" );
+    Serial.println( "APP SE KET NOI LAI KHI WIFI HOAT DONG" );
     Serial.println( "==============================" );
   }
-  if ( !wifiConfigPortalActive ) {
-    startWiFiConfigPortal();
-  }
+
   if ( WIFI_SSID.length() == 0 ) {
     return;
   }
+
   if ( millis() - lastWiFiReconnectAt < WIFI_RECONNECT_INTERVAL ) {
     return;
   }
+
   lastWiFiReconnectAt = millis();
-  Serial.println( "DANG THU KET NOI LAI WIFI STA DA LUU..." );
+  Serial.println( "DANG THU KET NOI LAI WIFI STA..." );
   WiFi.disconnect( false, false );
-  delay(100);
-  WiFi.mode( WIFI_AP_STA );
+  delay( 100 );
+  WiFi.mode( WIFI_STA );
   WiFi.begin( WIFI_SSID.c_str(), WIFI_PASSWORD.c_str() );
-}
-void maintainAPClients() {
-  if ( !wifiConfigPortalActive ) {
-    previousAPClientCount = 0;
-    return;
-  }
-  uint8_t currentAPClientCount = WiFi.softAPgetStationNum();
-  if ( currentAPClientCount > previousAPClientCount ) {
-    Serial.println();
-    Serial.println( "==============================" );
-    Serial.println( "THIET BI DA KET NOI SMARTDOOR_DIRECT" );
-    Serial.print( "SO THIET BI AP: " );
-    Serial.println( currentAPClientCount );
-    Serial.println( "CHO APP GUI API HEARTBEAT..." );
-    Serial.println( "==============================" );
-  }
-  if ( currentAPClientCount < previousAPClientCount ) {
-    Serial.print( "THIET BI NGAT SMARTDOOR_DIRECT - CON LAI: " );
-    Serial.println( currentAPClientCount );
-  }
-  previousAPClientCount = currentAPClientCount;
 }
 void noteAppContact() {
   lastAppContactAt = millis();
@@ -2565,10 +2427,6 @@ void setupWebServer() {
     Serial.println( WiFi.localIP() );
     Serial.println( "HOST: http://smartdoor.local" );
   }
-  if ( wifiConfigPortalActive ) {
-    Serial.println( "AP TRUC TIEP: SmartDoor_Direct" );
-    Serial.println( "API TRUC TIEP: http://192.168.4.1" );
-  }
 }
 void setup() {
   pinMode( RELAY_LOCK_PIN, OUTPUT );
@@ -2612,7 +2470,6 @@ void setup() {
   setupWiFi();
   feedWatchdog();
   setupWebServer();
-  showAPCredentialsAtBoot();
   digitalWrite( RELAY_LOCK_PIN, DOOR_LOCK_LEVEL );
   stopBuzzer();
   failedAttempts = 0;
@@ -2636,11 +2493,6 @@ void setup() {
   Serial.println( rfidOK ? "OK" : "LOI" );
   Serial.print( "WIFI: " );
   Serial.println( WiFi.status() == WL_CONNECTED ? "OK" : "OFFLINE" );
-  if ( wifiConfigPortalActive ) {
-    Serial.println( "AP TRUC TIEP: SmartDoor_Direct" );
-    Serial.println( "MAT KHAU AP: 12345678" );
-    Serial.println( "IP AP: http://192.168.4.1" );
-  }
   Serial.print( "MDNS: " );
   Serial.println( mdnsOK ? "OK" : "LOI" );
   if ( WiFi.status() == WL_CONNECTED ) {
@@ -2661,9 +2513,8 @@ void setup() {
 void loop() {
   feedWatchdog();
   maintainWiFi();
-  maintainAPClients();
   maintainSensors();
-  if ( webServerStarted && ( WiFi.status() == WL_CONNECTED || wifiConfigPortalActive ) ) {
+  if ( webServerStarted && WiFi.status() == WL_CONNECTED ) {
     server.handleClient();
   }
   updateAppConnectionState();
