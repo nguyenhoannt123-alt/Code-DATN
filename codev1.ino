@@ -17,6 +17,15 @@ String WIFI_SSID = WIFI_DEFAULT_SSID;
 String WIFI_PASSWORD = WIFI_DEFAULT_PASSWORD;
 const char* MDNS_HOSTNAME = "smartdoor";
 const unsigned long APP_CONNECTION_TIMEOUT = 5000;
+
+//thoi gian
+const long GMT_OFFSET_SEC = 7 * 3600;          
+const int DAYLIGHT_OFFSET_SEC = 0;             
+const time_t MIN_VALID_EPOCH = 1700000000;     
+const unsigned long TIME_SYNC_RETRY_INTERVAL = 60000; 
+unsigned long lastTimeSyncAttemptAt = 0;
+bool timeSynced = false;
+
 unsigned long lastAppContactAt = 0;
 bool appConnected = false;
 bool mdnsOK = false;
@@ -531,13 +540,96 @@ void hardwareError( const String& line1, const String& line2 ) {
   beepErrorShort();
   showResult( line1, line2 );
 }
+bool isTimeSynchronized() {
+  time_t now = time(nullptr);
+  return now >= MIN_VALID_EPOCH;
+}
+
+bool syncTimeNTP( unsigned long timeoutMs = 8000 ) {
+  if ( WiFi.status() != WL_CONNECTED ) {
+    timeSynced = false;
+    Serial.println( "NTP: KHONG CO WIFI - CHUA THE DONG BO" );
+    return false;
+  }
+
+  lastTimeSyncAttemptAt = millis();
+
+  Serial.println();
+  Serial.println( "==============================" );
+  Serial.println( "DANG DONG BO THOI GIAN NTP..." );
+
+  // Cau hinh mui gio Viet Nam UTC+7 va 2 NTP server.
+  configTime(
+    GMT_OFFSET_SEC,
+    DAYLIGHT_OFFSET_SEC,
+    "pool.ntp.org",
+    "time.google.com"
+  );
+
+  unsigned long startedAt = millis();
+  while ( millis() - startedAt < timeoutMs ) {
+    feedWatchdog();
+
+    // Neu web server da chay thi van phuc vu request trong luc cho NTP.
+    if ( webServerStarted && WiFi.status() == WL_CONNECTED ) {
+      server.handleClient();
+    }
+
+    if ( isTimeSynchronized() ) {
+      timeSynced = true;
+
+      time_t now = time(nullptr);
+      struct tm timeInfo;
+      localtime_r( &now, &timeInfo );
+      char buffer[25];
+      strftime( buffer, sizeof(buffer), "%d/%m/%Y %H:%M:%S", &timeInfo );
+
+      Serial.print( "NTP DONG BO THANH CONG: " );
+      Serial.println( buffer );
+      Serial.println( "==============================" );
+      return true;
+    }
+
+    delay(200);
+  }
+
+  timeSynced = false;
+  Serial.println( "NTP CHUA DONG BO - SE TU DONG THU LAI" );
+  Serial.println( "==============================" );
+  return false;
+}
+
+void maintainTimeSync() {
+  if ( WiFi.status() != WL_CONNECTED ) {
+    timeSynced = false;
+    return;
+  }
+
+  if ( isTimeSynchronized() ) {
+    timeSynced = true;
+    return;
+  }
+
+  timeSynced = false;
+
+  if ( millis() - lastTimeSyncAttemptAt < TIME_SYNC_RETRY_INTERVAL ) {
+    return;
+  }
+
+  // Neu lan khoi dong/chuyen mang chua dong bo duoc thi thu lai.
+  syncTimeNTP( 3000 );
+}
+
 String getCurrentTimeString() {
   time_t now = time(nullptr);
-  if ( now < 100000 ) {
+
+  if ( now < MIN_VALID_EPOCH ) {
     return "Chua dong bo";
   }
+
   struct tm timeInfo;
   localtime_r( &now, &timeInfo );
+
   char buffer[25];
   strftime( buffer, sizeof(buffer), "%d/%m/%Y %H:%M:%S", &timeInfo );
   return String(buffer);
@@ -1994,12 +2086,9 @@ void setupWiFi() {
     Serial.print( "IP ESP32: " );
     Serial.println( WiFi.localIP() );
     startMDNS();
-    configTime(
-      7 * 3600,
-      0,
-      "pool.ntp.org",
-      "time.google.com"
-    );
+
+    // Dong bo thoi gian ngay sau khi ket noi Wi-Fi thanh cong.
+    syncTimeNTP( 8000 );
   } else {
     wasWiFiConnected = false;
     mdnsOK = false;
@@ -2020,6 +2109,10 @@ void maintainWiFi() {
     Serial.println( WiFi.localIP() );
     mdnsOK = false;
     startMDNS();
+
+    // Moi lan Wi-Fi ket noi lai, yeu cau dong bo NTP lai.
+    syncTimeNTP( 5000 );
+
     Serial.print( "MDNS: " );
     Serial.println( mdnsOK ? "smartdoor.local" : "LOI" );
     Serial.println( "==============================" );
@@ -2513,6 +2606,7 @@ void setup() {
 void loop() {
   feedWatchdog();
   maintainWiFi();
+  maintainTimeSync();
   maintainSensors();
   if ( webServerStarted && WiFi.status() == WL_CONNECTED ) {
     server.handleClient();
